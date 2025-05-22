@@ -1,0 +1,170 @@
+#include <zlib.h>
+#include <iostream>
+#include <signal.h>
+#include <cassert>
+
+// Project-specific headers
+#include "utilities_gt.h"     // Contains data structures and utilities for GRETINA
+#include "HistPlotter.h"      // For histogram creation and output
+
+bool quit = false;
+
+// Signal handler to allow graceful termination with Ctrl+C
+void handler(int signal) { quit = true; }
+
+/**
+ * @brief Fills neutron damage correction histograms from a gammaRay object.
+ * @param plotter Reference to the HistPlotter instance
+ * @param gray gammaRay object created from decompressed event data
+ */
+void MakeNeutronDamagePlots(HistPlotter &plotter, const gammaRay &g1);
+
+int main(int argc, char** argv)
+{
+    GEBHeader header;              // Header for GRETINA event blocks
+    crys_intpts g1;                // Holds crystal interaction points
+    uint16_t junk[32768];         // Buffer for unhandled data blocks
+
+    // Check for correct usage
+    if(argc != 2) {
+        std::cout << "Usage: ./extract <path_to_hfc.dat.gz_file>" << std::endl;
+        return -1;
+    }
+
+    // Open gzipped binary file
+    gzFile infile = (gzFile)gzopen(argv[1], "rb");
+    if(infile == Z_NULL) {
+        std::cout << "Error: File " << argv[1] << " not found." << std::endl;
+        return -2;
+    }
+
+    // Initialize output file and histogram plotter
+    HistPlotter plotter("output.root");
+
+    std::cout << "Bend database populated with " << bend_db.size() << " members.. " << std::endl;
+
+    // Load rotation matrix for detector geometry
+    rotationMatrix rmat("crmat.dat");
+    rmat.SetYOffsets(23.7, -20.8);  // Set Y-axis offsets for the hemispheres
+
+    float beta = 0.0;  // Relativistic beta, 0 = not moving
+
+    gzrewind(infile);              // Reset file pointer to start
+    signal(SIGINT, handler);       // Setup Ctrl+C handler
+
+    int ctr = 0;                   // Event counter
+
+    // Main loop: read until EOF or user interruption
+    while(!gzeof(infile))
+    {
+        // Read event header
+        int len = gzread(infile, &header, sizeof(header)); (void)len;
+
+        switch(header.type) {
+            case 1:
+                // Type 1: decomposed crystal interaction event
+                gzread(infile, &g1, header.length);
+
+                if(g1.pad == 0) { // Skip decomp error events
+                    gammaRay gray(g1, rmat, beta); // Reconstruct gamma-ray
+                    MakeNeutronDamagePlots(plotter, gray);
+                }
+                break;
+
+            case 5:
+            case 19:
+            default:
+                // Skip other types of events
+                assert(header.length < 32768);
+                gzread(infile, &junk, header.length);
+        }
+
+        if(quit) break;
+
+        // Progress output every 400,000 events
+        ctr++;
+        if(ctr == 4e5) std::cout << "." << std::flush;
+    }
+
+    // Finalize and write output
+    std::cout << "Writing to disk .." << std::flush;
+    plotter.FlushToDisk();
+    std::cout << " done." << std::endl;
+
+    gzclose(infile);
+    return 0;
+}
+
+/**
+ * @brief Fills histograms related to neutron damage correction and energy calibration.
+ * @param plotter Histogram plotter instance
+ * @param gray gammaRay object reconstructed from event data
+ */
+void MakeNeutronDamagePlots(HistPlotter &plotter, const gammaRay &gray) {
+    // Only process valid decomposed segments (<=6)
+    if (gray.maxseg / 6 <= 6) {
+
+        int maxseg = gray.maxseg / 6;
+        int xtal = gray.raw_data.crystal_id;
+
+        // Fill total energy histogram vs radial interaction point
+        if (maxseg > 0) {
+            plotter.Fill2D(Form("xtal_r_vs_tote_x#%d_s#%d", xtal, maxseg),
+                           200, 0, 100, 2000, 0, 2000,
+                           gray.xtal_r_maxintp, gray.raw_data.tot_e, "cc");
+        }
+
+        // Special case for center segments
+        if (maxseg == 0) {
+            plotter.Fill2D(Form("xtal_z_vs_tote_x#%d_s#%d", xtal, maxseg),
+                           200, -10, 40, 2000, 0, 2000,
+                           gray.xtal_z_maxintp, gray.raw_data.tot_e, "cc");
+        }
+
+        plotter.Fill2D(Form("xtalseg%d_vs_e", maxseg),
+                       2000, 0, 2000, 100, 0, 100,
+                       gray.raw_data.tot_e, xtal);
+
+        // Skip if neutron damage database is empty
+        if (bend_db.size() == 0) return;
+
+        // --- Neutron damage correction ---
+        float fixed_tote = gray.raw_data.tot_e;
+        if (maxseg != 0) {
+            float knee = bend_db[xtal].at(maxseg).knee * 40.0;
+            float slope = bend_db[xtal].at(maxseg).slope - 1.0;
+            if (gray.xtal_r_maxintp < knee)
+                fixed_tote /= (1.0 + (1.0 - gray.xtal_r_maxintp / knee) * slope);
+        } else {
+            float p1 = bend_db[xtal].at(maxseg).knee * 1e-3;
+            float p2 = bend_db[xtal].at(maxseg).slope * 1e-3;
+            float z = gray.xtal_z_maxintp;
+            fixed_tote /= (1.0 + p1 * z + p2 * z * z);
+        }
+
+        // Fill histograms for fixed and original energy
+        plotter.Fill1D("fixed_tote", 2000, 0, 2000, fixed_tote);
+        plotter.Fill1D("nonfixed_tote", 2000, 0, 2000, gray.raw_data.tot_e);
+
+        if (maxseg == 0) {
+            plotter.Fill2D(Form("xtal_z_vs_ftote_x#%d_s#%d", xtal, maxseg),
+                           200, -10, 40, 2000, 0, 2000,
+                           gray.xtal_z_maxintp, fixed_tote);
+        }
+
+        // --- Fine gain calibration ---
+        if (fine_calib.size() == 0) return;
+
+        float yint_finegain = fine_calib[xtal].at(maxseg).first;
+        float slope_finegain = fine_calib[xtal].at(maxseg).second;
+
+        float finematched = fixed_tote + fixed_tote * slope_finegain + yint_finegain;
+
+        plotter.Fill1D("finematched_tote", 4096, 0, 2048, finematched);
+        plotter.Fill2D(Form("finematched_xtalseg%d_vs_e", maxseg),
+                       2000, 0, 2000, 100, 0, 100, finematched, xtal);
+        plotter.Fill2D(Form("finematched_xtal_r_vs_tote_x#%d_s#%d", xtal, maxseg),
+                       200, 0, 100, 2000, 0, 2000,
+                       gray.xtal_r_maxintp, finematched);
+    }
+}
